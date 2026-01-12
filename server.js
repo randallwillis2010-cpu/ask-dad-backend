@@ -102,7 +102,7 @@ app.post("/ask-dad", (req, res) => {
 });
 
 // ---------- Start server ----------
-const PORT = 4000;
+const PORT = process.env.PORT || 4000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log("✅ Ask Dad backend running (OFFLINE mode)");
   console.log(`✅ Local:  http://localhost:${PORT}`);
