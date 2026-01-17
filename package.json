@@ -1,18 +1,19 @@
 {
   "name": "ask-dad-backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
- "scripts": {
-  "start": "node server.js"
-}
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^5.2.1"
+    "dotenv": "^17.2.3",
+    "express": "^4.18.3",
+    "openai": "^6.16.0"
   }
 }
