@@ -1,4 +1,8 @@
-// server.js
+// server.js (Ask Dad + Dad Jokes + Homework Help w/ photo + ElevenLabs streaming)
+// ✅ Uses OpenAI Responses API for image+text (vision)
+// ✅ Returns full absolute ttsUrl
+// ✅ Avoids JSON parse crash by always returning JSON errors
+
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -6,34 +10,40 @@ import { Readable } from "node:stream";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "8mb" }));
 
 /**
  * ENV needed on Render:
  * OPENAI_API_KEY
  * ELEVENLABS_API_KEY
  * ELEVENLABS_VOICE_ID
+ *
+ * Recommended on Render:
+ * RENDER_EXTERNAL_URL = https://ask-dad-backend.onrender.com
  */
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 
+const PORT = process.env.PORT || 10000;
+const BASE_URL =
+  process.env.RENDER_EXTERNAL_URL?.replace(/\/+$/, "") ||
+  `http://localhost:${PORT}`;
+
 /* ---------------------------
-   Simple in-memory TTS cache
+   TTS Cache (short-lived)
 ----------------------------*/
-const TTS_CACHE = new Map(); // id -> { text, expiresAt }
-const TTS_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const TTS_CACHE = new Map(); // id -> { payload: {text, mode}, expiresAt }
+const TTS_TTL_MS = 10 * 60 * 1000;
 
 function makeId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
-
 function cacheTtsPayload(payload) {
   const id = makeId();
   TTS_CACHE.set(id, { payload, expiresAt: Date.now() + TTS_TTL_MS });
   return id;
 }
-
 setInterval(() => {
   const now = Date.now();
   for (const [id, v] of TTS_CACHE.entries()) {
@@ -42,24 +52,25 @@ setInterval(() => {
 }, 60_000);
 
 /* ---------------------------
-   Routes
+   Basic routes
 ----------------------------*/
 app.get("/", (req, res) => res.send("✅ Ask Dad backend alive"));
 app.get("/health", (req, res) => res.json({ ok: true }));
-app.get("/debug-env", (req, res) => {
-  res.json({
-    hasOpenAI: !!process.env.OPENAI_API_KEY,
-    hasElevenKey: !!process.env.ELEVENLABS_API_KEY,
-    hasElevenVoice: !!process.env.ELEVENLABS_VOICE_ID,
-    node: process.version,
-  });
-});
 
 /* ---------------------------
-   MODE PROMPTS
+   Prompts
 ----------------------------*/
 function modeSystemPrompt(mode) {
   switch (mode) {
+    case "homework":
+      return `You are "Homework Dad": a kind, patient tutor. Teach, don’t just answer.
+Rules:
+- Explain step-by-step clearly.
+- For math/science: show steps, formulas, and reasoning.
+- For writing: help outline, improve, and give examples.
+- If the question/photo is unclear, ask ONE short clarifying question.
+- Keep it friendly and encouraging.`;
+
     case "coach":
       return `You are "Dad Coach": upbeat, direct, motivating, short steps, confidence-building. No fluff.`;
     case "soft":
@@ -69,7 +80,7 @@ function modeSystemPrompt(mode) {
     case "funny":
       return `You are "Goofy Dad": playful, corny jokes sprinkled in, still helpful and step-by-step.`;
     case "dadjokes":
-      return `You only tell ONE original dad joke per request. Must be new, not a classic from a known list. Short.`;
+      return `You only tell ONE original dad joke per request. Must be new, not a known classic. Short. Family-friendly.`;
     default:
       return `You are "Ask Dad": supportive, practical, step-by-step, warm and slightly funny.`;
   }
@@ -77,33 +88,26 @@ function modeSystemPrompt(mode) {
 
 /* ---------------------------
    OpenAI helpers
+   - /ask-dad uses chat/completions (text-only)
+   - /homework-help uses responses API (image+text)
 ----------------------------*/
 function normalize(s) {
   return String(s || "")
     .toLowerCase()
-    .replace(/\s+/g, " ")
+    .replace(/[\u2019']/g, "'")
     .replace(/[^\w\s]/g, "")
+    .replace(/\s+/g, " ")
     .trim();
 }
-
 function isRepeatedJoke(joke, history = []) {
   const j = normalize(joke);
   return history.some((h) => normalize(h) === j);
 }
 
-async function callOpenAI(messages, temperature = 0.8) {
+async function callOpenAIChat({ messages, temperature = 0.85, model = "gpt-4.1-mini" }) {
   if (!OPENAI_API_KEY) {
-    return {
-      ok: false,
-      text: "Backend missing OPENAI_API_KEY. Add it in Render → Environment.",
-    };
+    return { ok: false, text: "Missing OPENAI_API_KEY on backend." };
   }
-
-  const body = {
-    model: "gpt-4.1-mini",
-    temperature,
-    messages,
-  };
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -111,12 +115,12 @@ async function callOpenAI(messages, temperature = 0.8) {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ model, temperature, messages }),
   });
 
   if (!r.ok) {
     const t = await r.text();
-    console.log("OpenAI error:", r.status, t);
+    console.log("OpenAI chat error:", r.status, t);
     return { ok: false, text: "Dad brain is busy right now. Try again in a minute." };
   }
 
@@ -125,14 +129,57 @@ async function callOpenAI(messages, temperature = 0.8) {
   return { ok: true, text: text || "…Dad blanked. Try again." };
 }
 
+async function callOpenAIResponses({ input, model = "gpt-4.1-mini", temperature = 0.7 }) {
+  if (!OPENAI_API_KEY) {
+    return { ok: false, text: "Missing OPENAI_API_KEY on backend." };
+  }
+
+  // Responses API supports multimodal content
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      temperature,
+      input,
+    }),
+  });
+
+  if (!r.ok) {
+    const t = await r.text();
+    console.log("OpenAI responses error:", r.status, t);
+    return { ok: false, text: "Homework Dad is busy right now. Try again in a minute." };
+  }
+
+  const json = await r.json();
+
+  // Pull text from output safely
+  const out = json?.output || [];
+  let text = "";
+  for (const item of out) {
+    const content = item?.content || [];
+    for (const c of content) {
+      if (c?.type === "output_text" && c?.text) {
+        text += c.text;
+      }
+    }
+  }
+
+  text = String(text || "").trim();
+  return { ok: true, text: text || "I couldn’t read that clearly—try a brighter, closer photo." };
+}
+
 async function getDadAnswer({ question, mode = "default", jokeHistory = [] }) {
   const system = modeSystemPrompt(mode);
 
   if (mode === "dadjokes") {
     const antiRepeat =
       jokeHistory?.length
-        ? `Avoid repeating any of these recent jokes:\n- ${jokeHistory
-            .slice(-15)
+        ? `Avoid repeating any of these recent jokes (even if reworded):\n- ${jokeHistory
+            .slice(-25)
             .join("\n- ")}`
         : "";
 
@@ -145,24 +192,26 @@ async function getDadAnswer({ question, mode = "default", jokeHistory = [] }) {
           `Create ONE brand-new dad joke.\n` +
           `Rules:\n` +
           `- Not a famous classic.\n` +
+          `- Different topic/setup/punchline than the recent list.\n` +
           `- One-liner or two short lines max.\n` +
           `- No preface like "Sure!"\n` +
-          `- No quotes.\n`,
+          `- No quotes.\n` +
+          `- Family-friendly.\n`,
       },
     ];
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const r = await callOpenAI(baseMessages, 1.1);
-      const joke = r.text || "I tried to tell a joke… but it needed a restart. 😄";
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      const r = await callOpenAIChat({ messages: baseMessages, temperature: 1.15 });
+      const joke = (r.text || "").trim() || "My joke drawer glitched… hit me again 😄";
       if (!isRepeatedJoke(joke, jokeHistory)) return joke;
 
       baseMessages.push({
         role: "system",
-        content: `Your last joke matched the recent list. Generate a completely different one with a different setup/punchline.`,
+        content: "Too similar. Generate a completely different new joke with a different topic.",
       });
     }
 
-    return "I’d tell you a new one… but my joke drawer’s stuck. Try again 😅";
+    return "Alright kiddo… my joke drawer’s stuck. Try again 😅";
   }
 
   const messages = [
@@ -179,72 +228,93 @@ async function getDadAnswer({ question, mode = "default", jokeHistory = [] }) {
     },
   ];
 
-  const r = await callOpenAI(messages, 0.8);
+  const r = await callOpenAIChat({ messages, temperature: 0.85 });
   return r.text;
 }
 
-/* ---------------------------
-   HUMAN CADENCE (TTS text cleanup)
-   Goal: sound less robotic + faster streaming
-----------------------------*/
-function humanCadenceText(input) {
-  let t = String(input || "");
+async function getHomeworkHelp({ question = "", imageBase64 = "" }) {
+  const q = String(question || "").trim();
+  const hasImage = !!imageBase64;
 
-  // remove emojis (TTS reads them weird)
-  t = t.replace(
-    /([\u2700-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|\uD83E[\uDD00-\uDFFF])/g,
-    ""
-  );
+  const system = modeSystemPrompt("homework");
 
-  // normalize whitespace/newlines
-  t = t.replace(/\r/g, "").replace(/\n{2,}/g, "\n").trim();
+  const content = [
+    {
+      type: "input_text",
+      text:
+        system +
+        "\n\n" +
+        (q ? `Student question: ${q}\n\n` : "") +
+        "If there’s a problem in the photo, solve it step-by-step and teach the method. " +
+        "If the student can copy answers, still teach the method first.",
+    },
+  ];
 
-  // make numbered steps clearer
-  // "1." -> "Step 1:"
-  t = t.replace(/(^|\n)\s*(\d+)\.\s+/g, (_, p1, n) => `${p1}Step ${n}: `);
+  if (hasImage) {
+    content.push({
+      type: "input_image",
+      image_url: `data:image/jpeg;base64,${imageBase64}`,
+    });
+  }
 
-  // gentle sentence splitting for long lines
-  // add micro-pauses around conjunctions
-  t = t
-    .replace(/\s+(and|but|so)\s+/gi, " ... $1 ")
-    .replace(/\s{2,}/g, " ");
+  const r = await callOpenAIResponses({
+    model: "gpt-4.1-mini",
+    temperature: 0.7,
+    input: [
+      {
+        role: "user",
+        content,
+      },
+    ],
+  });
 
-  // add pauses after punctuation
-  t = t.replace(/([.!?])\s+/g, "$1 ... ");
-
-  // convert newlines to pauses (dad talking, not reading)
-  t = t.replace(/\n+/g, " ... ");
-
-  // avoid super long TTS requests (keeps stream snappy)
-  if (t.length > 1600) t = t.slice(0, 1600) + " ...";
-
-  return t.trim();
+  return (r.text || "").trim() || "I couldn’t read that clearly—try a closer photo with better lighting.";
 }
 
 /* ---------------------------
-   ElevenLabs streaming TTS
+   ElevenLabs TTS (streaming)
 ----------------------------*/
 function voiceSettingsForMode(mode) {
   switch (mode) {
     case "coach":
-      return { stability: 0.28, similarity_boost: 0.85, style: 0.55, use_speaker_boost: true };
+      return { stability: 0.26, similarity_boost: 0.90, style: 0.62, use_speaker_boost: true };
     case "soft":
-      return { stability: 0.35, similarity_boost: 0.9, style: 0.35, use_speaker_boost: true };
+      return { stability: 0.34, similarity_boost: 0.92, style: 0.42, use_speaker_boost: true };
     case "tough":
-      return { stability: 0.4, similarity_boost: 0.88, style: 0.25, use_speaker_boost: true };
+      return { stability: 0.42, similarity_boost: 0.90, style: 0.28, use_speaker_boost: true };
     case "funny":
-      return { stability: 0.25, similarity_boost: 0.82, style: 0.65, use_speaker_boost: true };
+      return { stability: 0.22, similarity_boost: 0.88, style: 0.74, use_speaker_boost: true };
     case "dadjokes":
-      return { stability: 0.22, similarity_boost: 0.8, style: 0.75, use_speaker_boost: true };
+      return { stability: 0.20, similarity_boost: 0.86, style: 0.80, use_speaker_boost: true };
+    case "homework":
+      return { stability: 0.32, similarity_boost: 0.92, style: 0.40, use_speaker_boost: true };
     default:
-      return { stability: 0.3, similarity_boost: 0.88, style: 0.45, use_speaker_boost: true };
+      return { stability: 0.28, similarity_boost: 0.90, style: 0.55, use_speaker_boost: true };
   }
+}
+
+function humanCadenceText(input) {
+  let t = String(input || "").trim();
+  t = t.replace(/\r/g, "").replace(/[ \t]{2,}/g, " ");
+  t = t.replace(/\n{2,}/g, "\n").replace(/\n/g, ". ");
+
+  t = t
+    .replace(/\b1[\)\.\:]\s*/g, "First: ")
+    .replace(/\b2[\)\.\:]\s*/g, "Next: ")
+    .replace(/\b3[\)\.\:]\s*/g, "Then: ")
+    .replace(/\b4[\)\.\:]\s*/g, "After that: ")
+    .replace(/\b5[\)\.\:]\s*/g, "Finally: ");
+
+  t = t.replace(/([.!?])\s+/g, "$1 ... ");
+  t = t.replace(/,\s+/g, ", ... ");
+  if (t.length > 1800) t = t.slice(0, 1800);
+  return t.trim();
 }
 
 async function streamElevenLabsTTS(res, text, mode = "default") {
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
     res.status(500).json({
-      error: "Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID in Render Environment.",
+      error: "Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID.",
     });
     return;
   }
@@ -254,20 +324,27 @@ async function streamElevenLabsTTS(res, text, mode = "default") {
 
   const elevenUrl = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`;
 
-  const tts = await fetch(elevenUrl, {
-    method: "POST",
-    headers: {
-      "xi-api-key": ELEVENLABS_API_KEY,
-      "Content-Type": "application/json",
-      Accept: "audio/mpeg",
-    },
-    body: JSON.stringify({
-      text: dadText,
-      model_id: "eleven_turbo_v2_5",
-      optimize_streaming_latency: 3,
-      voice_settings: settings,
-    }),
-  });
+  let tts;
+  try {
+    tts = await fetch(elevenUrl, {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      body: JSON.stringify({
+        text: dadText,
+        model_id: "eleven_turbo_v2_5",
+        optimize_streaming_latency: 3,
+        voice_settings: settings,
+      }),
+    });
+  } catch (e) {
+    console.log("ElevenLabs fetch failed:", e);
+    res.status(500).json({ error: "ElevenLabs request failed" });
+    return;
+  }
 
   if (!tts.ok) {
     const errText = await tts.text();
@@ -280,26 +357,31 @@ async function streamElevenLabsTTS(res, text, mode = "default") {
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("Transfer-Encoding", "chunked");
 
-  const nodeStream = Readable.fromWeb(tts.body);
-  nodeStream.pipe(res);
+  try {
+    const nodeStream = Readable.fromWeb(tts.body);
+    nodeStream.on("error", (err) => {
+      console.log("TTS stream error:", err);
+      try { res.end(); } catch {}
+    });
+    nodeStream.pipe(res);
+  } catch (e) {
+    console.log("Readable.fromWeb failed:", e);
+    res.status(500).json({ error: "Streaming conversion failed" });
+  }
 }
 
 /* ---------------------------
-   Main endpoint used by app
+   Endpoints
 ----------------------------*/
 app.post("/ask-dad", async (req, res) => {
   try {
     const { question, mode = "default", jokeHistory = [] } = req.body || {};
-    console.log("📩 /ask-dad received:", { question, mode });
-
     const answer = await getDadAnswer({ question, mode, jokeHistory });
 
-    // store payload so the client can GET audio without giant text URLs
     const ttsId = cacheTtsPayload({ text: answer, mode });
-
     return res.json({
       answer,
-      ttsUrl: `/tts-stream/${ttsId}`,
+      ttsUrl: `${BASE_URL}/tts-stream/${ttsId}`,
     });
   } catch (e) {
     console.log("❌ /ask-dad crashed:", e);
@@ -307,35 +389,45 @@ app.post("/ask-dad", async (req, res) => {
   }
 });
 
-/* ---------------------------
-   Optional: create TTS id for any text
-----------------------------*/
-app.post("/tts-create", (req, res) => {
-  const { text, mode = "default" } = req.body || {};
-  if (!text) return res.status(400).json({ error: "Missing text" });
-  const id = cacheTtsPayload({ text, mode });
-  return res.json({ id, ttsUrl: `/tts-stream/${id}` });
+app.post("/homework-help", async (req, res) => {
+  try {
+    const { question = "", imageBase64 = "" } = req.body || {};
+
+    if (imageBase64 && imageBase64.length > 7_000_000) {
+      return res.status(400).json({
+        error: "Image too large. Try a closer photo of just the problem.",
+      });
+    }
+
+    const answer = await getHomeworkHelp({ question, imageBase64 });
+
+    const ttsId = cacheTtsPayload({ text: answer, mode: "homework" });
+    return res.json({
+      answer,
+      ttsUrl: `${BASE_URL}/tts-stream/${ttsId}`,
+    });
+  } catch (e) {
+    console.log("❌ /homework-help crashed:", e);
+    res.status(500).json({ error: "Homework help crashed" });
+  }
 });
 
-/* ---------------------------
-   Streaming voice endpoint (GET)
-----------------------------*/
 app.get("/tts-stream/:id", async (req, res) => {
   try {
     const id = req.params.id;
     const entry = TTS_CACHE.get(id);
     if (!entry) return res.status(404).send("TTS expired or not found.");
 
-    const payload = entry.payload || { text: "", mode: "default" };
-    return streamElevenLabsTTS(res, payload.text, payload.mode || "default");
+    const payload = entry.payload || {};
+    return streamElevenLabsTTS(res, payload.text || "", payload.mode || "default");
   } catch (e) {
     console.log("❌ /tts-stream crashed:", e);
     res.status(500).json({ error: "TTS stream crashed" });
   }
 });
 
-const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log("✅ Ask Dad backend running");
   console.log("✅ Port:", PORT);
+  console.log("✅ Base URL:", BASE_URL);
 });
